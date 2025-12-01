@@ -3793,6 +3793,50 @@ def load_app(target):
 _debug = debug
 
 
+def _run_reloader_loop(interval):
+    """Helper to handle the parent process logic when reloader=True."""
+    import subprocess
+    fd, lockfile = tempfile.mkstemp(prefix='bottle.', suffix='.lock')
+    environ = os.environ.copy()
+    environ['BOTTLE_CHILD'] = 'true'
+    environ['BOTTLE_LOCKFILE'] = lockfile
+    args = [sys.executable] + sys.argv
+        # If a package was loaded with `python -m`, then `sys.argv` needs to be
+        # restored to the original value, or imports might break. See #1336
+    if getattr(sys.modules.get('__main__'), '__package__', None):
+        args[1:1] = ["-m", sys.modules['__main__'].__package__]
+
+    try:
+        os.close(fd)  # We never write to this file
+        while os.path.exists(lockfile):
+            p = subprocess.Popen(args, env=environ)
+            while p.poll() is None:
+                os.utime(lockfile, None)  # Tell child we are still alive
+                time.sleep(interval)
+            if p.returncode == 3:  # Child wants to be restarted
+                continue
+            sys.exit(p.returncode)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if os.path.exists(lockfile):
+            os.unlink(lockfile)
+
+
+def _make_server(server, host, port, quiet, **kargs):
+    """Helper to instantiate the server adapter."""
+    if server in server_names:
+        server = server_names.get(server)
+    if isinstance(server, str):
+        server = load(server)
+    if isinstance(server, type):
+        server = server(host=host, port=port, **kargs)
+    if not isinstance(server, ServerAdapter):
+        raise ValueError("Unknown or unsupported server: %r" % server)
+    server.quiet = server.quiet or quiet
+    return server
+
+
 def run(app=None,
         server='wsgiref',
         host='127.0.0.1',
@@ -3804,49 +3848,12 @@ def run(app=None,
         debug=None,
         config=None, **kargs):
     """ Start a server instance. This method blocks until the server terminates.
-
-        :param app: WSGI application or target string supported by
-               :func:`load_app`. (default: :func:`default_app`)
-        :param server: Server adapter to use. See :data:`server_names` keys
-               for valid names or pass a :class:`ServerAdapter` subclass.
-               (default: `wsgiref`)
-        :param host: Server address to bind to. Pass ``0.0.0.0`` to listens on
-               all interfaces including the external one. (default: 127.0.0.1)
-        :param port: Server port to bind to. Values below 1024 require root
-               privileges. (default: 8080)
-        :param reloader: Start auto-reloading server? (default: False)
-        :param interval: Auto-reloader interval in seconds (default: 1)
-        :param quiet: Suppress output to stdout and stderr? (default: False)
-        :param options: Options passed to the server adapter.
-     """
+        (Refactored to reduce cyclomatic complexity)
+    """
     if NORUN: return
-    if reloader and not os.environ.get('BOTTLE_CHILD'):
-        import subprocess
-        fd, lockfile = tempfile.mkstemp(prefix='bottle.', suffix='.lock')
-        environ = os.environ.copy()
-        environ['BOTTLE_CHILD'] = 'true'
-        environ['BOTTLE_LOCKFILE'] = lockfile
-        args = [sys.executable] + sys.argv
-        # If a package was loaded with `python -m`, then `sys.argv` needs to be
-        # restored to the original value, or imports might break. See #1336
-        if getattr(sys.modules.get('__main__'), '__package__', None):
-            args[1:1] = ["-m", sys.modules['__main__'].__package__]
 
-        try:
-            os.close(fd)  # We never write to this file
-            while os.path.exists(lockfile):
-                p = subprocess.Popen(args, env=environ)
-                while p.poll() is None:
-                    os.utime(lockfile, None)  # Tell child we are still alive
-                    time.sleep(interval)
-                if p.returncode == 3:  # Child wants to be restarted
-                    continue
-                sys.exit(p.returncode)
-        except KeyboardInterrupt:
-            pass
-        finally:
-            if os.path.exists(lockfile):
-                os.unlink(lockfile)
+    if reloader and not os.environ.get('BOTTLE_CHILD'):
+        _run_reloader_loop(interval)
         return
 
     try:
@@ -3865,16 +3872,8 @@ def run(app=None,
         if config:
             app.config.update(config)
 
-        if server in server_names:
-            server = server_names.get(server)
-        if isinstance(server, str):
-            server = load(server)
-        if isinstance(server, type):
-            server = server(host=host, port=port, **kargs)
-        if not isinstance(server, ServerAdapter):
-            raise ValueError("Unknown or unsupported server: %r" % server)
+        server = _make_server(server, host, port, quiet, **kargs)
 
-        server.quiet = server.quiet or quiet
         if not server.quiet:
             _stderr("Bottle v%s server starting up (using %s)..." %
                     (__version__, repr(server)))
